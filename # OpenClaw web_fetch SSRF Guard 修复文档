@@ -1,0 +1,168 @@
+**适用版本：** OpenClaw 2026.3.13 (61d171a)
+**适用场景：** macOS + Shadowrocket (fake-ip模式) 环境下 web_fetch 被 SSRF guard 拦截
+**创建日期：** 2026-03-18
+
+---
+
+## 一、问题描述
+
+OpenClaw的web_fetch工具在Shadowrocket环境下无法访问任何外部URL，报错信息为：
+
+```json
+{"status":"error","tool":"web_fetch","error":"Blocked: resolves to private/internal/special-use IP address"}
+```
+
+同一环境下web_search工具正常工作，浏览器正常上网。
+
+---
+
+## 二、根因分析
+
+### 2.1 Shadowrocket的fake-ip机制
+
+Shadowrocket在TUN层拦截所有DNS查询，对所有域名返回198.18.x.x的虚拟IP地址。当应用实际连接198.18.x.x时，Shadowrocket在网络层拦截连接，用真实DNS重新解析，然后通过代理服务器转发。198.18.0.0/15属RFC2544 benchmark专用段。
+
+验证命令：
+
+```bash
+nslookup www.reuters.com
+```
+
+如果返回198.18.开头的地址，说明Shadowrocket fake-ip正在工作。
+
+### 2.2 OpenClaw的SSRF Guard机制
+
+web_fetch在发起网络请求之前，会通过 `resolvePinnedHostnameWithPolicy` 函数做DNS预检查。该函数内部先做DNS解析，然后检查解析结果是否属于私有/特殊用途地址段。198.18.x.x被判定为RFC2544特殊用途段，直接抛出 `SsrFBlockedError` 异常。
+
+关键代码位于 `resolvePinnedHostnameWithPolicy` 函数内：
+
+```javascript
+const skipPrivateNetworkChecks = allowPrivateNetwork || isExplicitAllowed;
+// ...DNS解析...
+if (!skipPrivateNetworkChecks) assertAllowedResolvedAddressesOrThrow(results, params.policy);
+```
+
+当 `skipPrivateNetworkChecks` 为 `false` 时，`assertAllowedResolvedAddressesOrThrow` 检查到198.18.x.x，抛出异常，后续所有代码（包括实际发起网络连接的代码）均未执行。
+
+### 2.3 完整链条
+
+```
+agent要访问github.com
+  → DNS解析结果被Shadowrocket替换为198.18.0.36
+  → resolvePinnedHostnameWithPolicy检查IP
+  → 判定为特殊用途地址
+  → 抛出SsrFBlockedError
+  → web_fetch返回拦截错误
+```
+
+web_search能正常工作是因为它走了信任模式（`withTrustedWebToolsEndpoint`），传了 `WEB_TOOLS_TRUSTED_NETWORK_SSRF_POLICY` 跳过了这个检查。web_fetch走的是严格模式（`withStrictWebToolsEndpoint`），没有传这个policy。
+
+---
+
+## 三、修复位置
+
+### 3.1 文件路径
+
+所有需要修改的文件均位于：
+
+```
+/opt/homebrew/lib/node_modules/openclaw/dist/
+```
+
+### 3.2 需要修改的文件列表
+
+| 文件名 | 行号 | 备注 |
+|--------|------|------|
+| `reply-Bm8VrLQh.js` | 16519 | web_fetch主路径 |
+| `auth-profiles-DDVivXkv.js` | 17579 | 副本 |
+| `auth-profiles-DRjqKE3G.js` | 15350 | 副本 |
+| `discord-CcCLMjHw.js` | 9897 | 副本 |
+| `model-selection-46xMp11W.js` | 18763 | 副本 |
+| `model-selection-CU2b7bN6.js` | 18296 | 副本 |
+
+> 注意：文件名包含hash值，不同版本的文件名会不同，但修改方式完全相同。
+
+---
+
+## 四、修复方法
+
+### 4.1 定位目标
+
+在每个文件中找到 `resolvePinnedHostnameWithPolicy` 函数内的以下语句：
+
+```javascript
+if (!skipPrivateNetworkChecks) assertAllowedResolvedAddressesOrThrow(results, params.policy);
+```
+
+### 4.2 修改方式
+
+注释原行，在其下方添加新行：
+
+```javascript
+//if (!skipPrivateNetworkChecks) assertAllowedResolvedAddressesOrThrow(results, params.policy);
+if (!skipPrivateNetworkChecks && !results.every(r => r.address?.startsWith("198.18."))) assertAllowedResolvedAddressesOrThrow(results, params.policy);
+```
+
+### 4.3 修改逻辑说明
+
+- **原始逻辑：** 如果 `skipPrivateNetworkChecks` 为 `false`，对所有解析出的IP地址做私有网络检查，198.18.x.x会被拦截。
+- **修改后逻辑：** 如果 `skipPrivateNetworkChecks` 为 `false`，且解析结果不是全部198.18.开头，才做私有网络检查。即：只豁免了Shadowrocket fake-ip的198.18.0.0/15地址段，其他私有地址（127.x、192.168.x、10.x）仍然被拦截。
+
+---
+
+## 五、执行步骤
+
+1. 用VS Code打开上述6个文件，用 `Cmd+G` 跳到对应行号
+2. 在原行前加 `//` 注释掉
+3. 在注释行下方添加新的判断语句
+4. 保存所有文件
+5. 运行 `openclaw gateway restart`
+6. 让agent用web_fetch测试任意外部URL
+
+打开文件的命令：
+
+```bash
+open -a "Visual Studio Code" /opt/homebrew/lib/node_modules/openclaw/dist/reply-Bm8VrLQh.js
+open -a "Visual Studio Code" /opt/homebrew/lib/node_modules/openclaw/dist/auth-profiles-DDVivXkv.js
+open -a "Visual Studio Code" /opt/homebrew/lib/node_modules/openclaw/dist/auth-profiles-DRjqKE3G.js
+open -a "Visual Studio Code" /opt/homebrew/lib/node_modules/openclaw/dist/discord-CcCLMjHw.js
+open -a "Visual Studio Code" /opt/homebrew/lib/node_modules/openclaw/dist/model-selection-46xMp11W.js
+open -a "Visual Studio Code" /opt/homebrew/lib/node_modules/openclaw/dist/model-selection-CU2b7bN6.js
+```
+
+---
+
+## 六、为什么只豁免198.18是安全的
+
+198.18.0.0/15是RFC2544 benchmark专用地址段，现实网络中几乎无人使用。Shadowrocket选择这个段做fake-ip正是因为它不会与真实局域网冲突。
+
+Shadowrocket不会使用127.x（系统回环）、10.x或192.168.x（常见局域网）做fake-ip，因为这会与本地网络冲突。因此只豁免198.18不会影响对其他私有地址的SSRF保护。
+
+---
+
+## 七、版本升级注意事项
+
+OpenClaw升级时，dist目录会被覆盖，所有修改会丢失。升级后需要重新执行以下操作：
+
+1. 用grep命令找到新版本中的所有副本：
+
+```bash
+grep -rn "skipPrivateNetworkChecks) assertAllowedResolvedAddressesOrThrow" /opt/homebrew/lib/node_modules/openclaw/dist/*.js
+```
+
+2. 文件名和行号可能会变（因为文件名含有hash），但修改方式完全相同
+3. 对每个找到的文件执行同样的修改（注释原行 + 添加新行）
+4. 修改后运行 `openclaw gateway restart`
+
+如果未来OpenClaw官方合并了PR #24427（`tools.web.fetch.allowPrivateNetwork` 配置项），则可以改用配置方式解决，不再需要改源码。升级时检查该PR状态：https://github.com/openclaw/openclaw/pull/24427
+
+相关issue：https://github.com/openclaw/openclaw/issues/29669
+
+---
+
+## 八、验证方法
+
+1. 运行 `openclaw gateway restart`
+2. 让agent使用web_fetch访问任意外部URL，例如 `https://github.com/openclaw/openclaw`
+3. 如果返回页面内容而非报错，修复成功
+4. 如果仍然报错，用grep检查是否有遗漏的副本未修改
